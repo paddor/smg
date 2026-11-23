@@ -2247,7 +2247,7 @@ mod tests {
         };
         assert_eq!(zmq_status(closed()).code(), Code::Unavailable);
         assert_eq!(zmq_status(Error::EngineCoreDead).code(), Code::Unavailable);
-        let transport = Error::Transport(zeromq::ZmqError::NoMessage);
+        let transport = Error::Transport(omq_tokio::Error::Closed);
         assert_eq!(zmq_status(transport).code(), Code::Unavailable);
         // A stream closed without a terminal output is not served here,
         // but the engine behind it is healthy: see `is_served_elsewhere`.
@@ -2449,13 +2449,7 @@ mod tests {
                 EosTokenIds::default(),
                 Duration::from_secs(10),
             ),
-            async {
-                engine
-                    .redial(&handshake)
-                    .await?
-                    .ready(default_ready_response())
-                    .await
-            },
+            engine.ready(default_ready_response()),
         );
         let client = client.expect("the retry connects the engine");
         engine.expect("mock engine connected");

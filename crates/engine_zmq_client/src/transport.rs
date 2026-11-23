@@ -13,17 +13,17 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Debug,
     ops::Deref,
+    time::Duration,
 };
 
 use bytes::Bytes;
-use futures::channel::mpsc::Receiver as SocketEvents;
+use futures::{
+    channel::mpsc::{channel as event_channel, Receiver as PeerEvents},
+    SinkExt,
+};
+use omq_tokio::{Message, MonitorEvent, MonitorRecvError, Options, Socket, SocketType};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
-use zeromq::{
-    prelude::{Socket, SocketRecv, SocketSend},
-    util::PeerIdentity,
-    PullSocket, RouterRecvHalf, RouterSendHalf, RouterSocket, SocketEvent, ZmqError, ZmqMessage,
-};
 
 use crate::{
     codec::{decode_msgpack, encode_msgpack},
@@ -107,14 +107,6 @@ impl<const N: usize> From<&[u8; N]> for EngineId {
     }
 }
 
-impl TryFrom<EngineId> for PeerIdentity {
-    type Error = ZmqError;
-
-    fn try_from(value: EngineId) -> std::result::Result<Self, Self::Error> {
-        PeerIdentity::try_from(value.into_frame())
-    }
-}
-
 /// Per-engine handshake result collected while bootstrapping one shared
 /// transport.
 #[derive(Clone, Debug)]
@@ -134,14 +126,61 @@ pub struct ConnectedTransport {
     pub output_address: String,
     /// All engines connected through the startup handshake.
     pub engines: Vec<ConnectedEngine>,
-    /// The sending half of the shared input ROUTER socket.
-    pub input_send: RouterSendHalf,
-    /// Reports asynchronous disconnects after local send admission.
-    pub input_events: SocketEvents<SocketEvent>,
-    /// Drives read-side disconnect detection after the registration handshake.
-    pub input_recv: RouterRecvHalf,
+    /// The shared input ROUTER socket. Clones share it, so one task can write
+    /// while another reads.
+    pub input_socket: Socket,
+    /// Reports engine handshakes and disconnects on the input socket.
+    pub input_events: PeerEvents<PeerEvent>,
     /// The shared output PULL socket for receiving all engines' responses.
-    pub output_socket: PullSocket,
+    pub output_socket: Socket,
+}
+
+/// A peer event on the shared input socket, by engine identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PeerEvent {
+    /// A connection under this identity completed its handshake.
+    Admitted(Bytes),
+    /// The connection under this identity ended.
+    Disconnected(Bytes),
+}
+
+/// Room for the input socket's peer events until the client reads them.
+const PEER_EVENT_CAPACITY: usize = 1024;
+
+/// The input socket's handshakes and disconnects as [`PeerEvent`]s, from the
+/// bind on. Connections without a declared identity are not engines and are
+/// left out.
+fn peer_events(socket: &Socket) -> PeerEvents<PeerEvent> {
+    let mut monitor = socket.monitor();
+    let (mut events, receiver) = event_channel(PEER_EVENT_CAPACITY);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the forwarder ends with the socket's monitor or the client's receiver"
+    )]
+    tokio::spawn(async move {
+        loop {
+            let event = match monitor.recv().await {
+                Ok(MonitorEvent::HandshakeSucceeded { peer, .. }) => {
+                    peer.peer_identity.map(PeerEvent::Admitted)
+                }
+                Ok(MonitorEvent::Disconnected { peer, .. }) => {
+                    peer.peer_identity.map(PeerEvent::Disconnected)
+                }
+                Ok(_) => None,
+                Err(MonitorRecvError::Lagged(missed)) => {
+                    warn!(missed, "input socket monitor lagged; peer events were lost");
+                    None
+                }
+                Err(_) => return,
+            };
+            if let Some(event) = event {
+                if events.send(event).await.is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    receiver
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -223,14 +262,14 @@ pub async fn connect_handshake(
 
     // 1. Bind shared input/output sockets first so every engine receives the
     //    same data-plane addresses during handshake.
-    let (input_address, mut input_socket, output_address, output_socket) =
+    let (input_address, input_socket, output_address, output_socket) =
         bind_local_sockets(local_input_address, local_output_address).await?;
-    let input_events = input_socket.monitor();
+    let input_events = peer_events(&input_socket);
     info!(%input_address, %output_address, "bound local transport sockets");
 
     // 2. Bind the shared handshake socket. All engines connect here with their
     //    own identities; startup order does not matter.
-    let mut handshake_socket = RouterSocket::new();
+    let handshake_socket = Socket::new(SocketType::Router, engine_socket_options());
     handshake_socket.bind(handshake_address).await?;
 
     let mut engines: BTreeMap<EngineId, EngineStartupState> = BTreeMap::new();
@@ -284,7 +323,7 @@ pub async fn connect_handshake(
                 None if awaiting_hello => {
                     debug!(?engine_id, "received HELLO from engine");
                     send_init_message(
-                        &mut handshake_socket,
+                        &handshake_socket,
                         &engine_id,
                         &input_address,
                         &output_address,
@@ -305,7 +344,7 @@ pub async fn connect_handshake(
                          process restarted while it was loading; greeting it again"
                     );
                     send_init_message(
-                        &mut handshake_socket,
+                        &handshake_socket,
                         &engine_id,
                         &input_address,
                         &output_address,
@@ -353,41 +392,55 @@ pub async fn connect_handshake(
     }
 
     // 4. Wait for every engine to register on the shared input socket.
-    let engines =
-        wait_for_input_registrations(&mut input_socket, engines.into_keys(), &clock).await?;
+    let engines = wait_for_input_registrations(&input_socket, engines.into_keys(), &clock).await?;
     info!(engine_count = engines.len(), "engines connected");
-
-    let (input_send, input_recv) = input_socket.split();
 
     Ok(ConnectedTransport {
         input_address,
         output_address,
         engines,
-        input_send,
+        input_socket,
         input_events,
-        input_recv,
         output_socket,
     })
 }
 
+/// How long the input socket keeps sending the frames it admitted once the
+/// client is dropped.
+const INPUT_LINGER: Duration = Duration::from_secs(10);
+
+/// Options for the frontend's engine sockets. Engines are local processes
+/// whose messages carry one aux frame per tensor, so the part count is not
+/// capped.
+fn engine_socket_options() -> Options {
+    Options::default().max_message_parts(None)
+}
+
 /// Bind the shared input (ROUTER) and output (PULL) sockets to the given
-/// addresses (`ipc://` on the same host, `tcp://` otherwise).
+/// addresses (`ipc://` on the same host, `tcp://` otherwise). Sends to an
+/// identity the input socket does not know fail, and sends to a full peer queue
+/// wait, as the connector's admission and death timeouts expect.
 async fn bind_local_sockets(
     local_input_address: &str,
     local_output_address: &str,
-) -> Result<(String, RouterSocket, String, PullSocket)> {
-    let mut input_socket = RouterSocket::new();
+) -> Result<(String, Socket, String, Socket)> {
+    let input_socket = Socket::new(
+        SocketType::Router,
+        engine_socket_options()
+            .router_mandatory(true)
+            .linger(INPUT_LINGER),
+    );
     let input_address = input_socket.bind(local_input_address).await?.to_string();
 
-    let mut output_socket = PullSocket::new();
+    let output_socket = Socket::new(SocketType::Pull, engine_socket_options());
     let output_address = output_socket.bind(local_output_address).await?.to_string();
 
     Ok((input_address, input_socket, output_address, output_socket))
 }
 
 /// Decode a 2-frame handshake message `[engine_id, ready-payload]`.
-fn decode_handshake_message(message: ZmqMessage) -> Result<(EngineId, ReadyMessage)> {
-    let frames = message.into_vec();
+fn decode_handshake_message(message: Message) -> Result<(EngineId, ReadyMessage)> {
+    let frames: Vec<Bytes> = message.iter().collect();
     let [id_frame, payload] = frames.as_slice() else {
         return Err(unexpected_handshake(format!(
             "expected 2 frames, got {}",
@@ -401,7 +454,7 @@ fn decode_handshake_message(message: ZmqMessage) -> Result<(EngineId, ReadyMessa
 
 /// Send an INIT message giving the engine the frontend's data-plane addresses.
 async fn send_init_message(
-    handshake_socket: &mut RouterSocket,
+    handshake_socket: &Socket,
     engine_id: &EngineId,
     input_address: &str,
     output_address: &str,
@@ -418,9 +471,12 @@ async fn send_init_message(
     };
     let payload = encode_msgpack(&init_message)?;
 
-    let mut message = ZmqMessage::from(engine_id.to_frame());
-    message.push_back(Bytes::from(payload));
-    handshake_socket.send(message).await?;
+    handshake_socket
+        .send(Message::multipart([
+            engine_id.to_frame(),
+            Bytes::from(payload),
+        ]))
+        .await?;
     debug!(?engine_id, "sent INIT to engine");
     Ok(())
 }
@@ -428,7 +484,7 @@ async fn send_init_message(
 /// Wait for each engine to connect to the shared input socket and register with
 /// `[identity, EngineCoreReadyResponse]`.
 async fn wait_for_input_registrations(
-    input_socket: &mut RouterSocket,
+    input_socket: &Socket,
     expected_engines: impl IntoIterator<Item = EngineId>,
     clock: &StartupClock,
 ) -> Result<Vec<ConnectedEngine>> {
@@ -447,7 +503,7 @@ async fn wait_for_input_registrations(
                 other => other,
             })??;
 
-        let frames = registration.into_vec();
+        let frames: Vec<Bytes> = registration.iter().collect();
         let [id_frame, payload] = frames.as_slice() else {
             return Err(unexpected_handshake(format!(
                 "expected 2 frames for engine input registration, got {}",
@@ -509,24 +565,23 @@ pub fn check_engine_layouts<P: EngineProtocol>(transport: &ConnectedTransport) -
 /// Send an encoded request to one engine over the shared input ROUTER socket.
 /// Frames: `[engine_id, request_type, payload, aux..]`.
 pub async fn send_message(
-    input_send: &mut RouterSendHalf,
+    input_socket: &Socket,
     engine_id: &EngineId,
     request_type: Bytes,
     payload: Bytes,
     aux_frames: Vec<Bytes>,
 ) -> Result<()> {
-    let mut message = ZmqMessage::from(engine_id.to_frame());
-    message.push_back(request_type);
-    message.push_back(payload);
-    for frame in aux_frames {
-        message.push_back(frame);
-    }
+    let message = Message::multipart(
+        [engine_id.to_frame(), request_type, payload]
+            .into_iter()
+            .chain(aux_frames),
+    );
     trace!(
         ?engine_id,
         frame_count = message.len(),
         "sending ZMQ message"
     );
-    input_send.send(message).await?;
+    input_socket.send(message).await?;
     Ok(())
 }
 
@@ -535,7 +590,7 @@ pub async fn send_message(
 /// `ENGINE_CORE_DEAD` sentinel, a transport error, or when the receiver is
 /// dropped. Decode errors are forwarded but do not stop the loop.
 pub async fn run_output_loop<P: EngineProtocol>(
-    mut output_socket: PullSocket,
+    output_socket: Socket,
     tx: mpsc::Sender<Result<EngineBatch<P::Output>>>,
     layout: P::Layout,
 ) {
@@ -549,7 +604,7 @@ pub async fn run_output_loop<P: EngineProtocol>(
             }
         };
 
-        let frames = message.into_vec();
+        let frames: Vec<Bytes> = message.iter().collect();
         let Some(frame) = frames.first() else {
             warn!("received empty output message; skipping");
             continue;
@@ -650,7 +705,7 @@ mod tests {
         );
 
         let ConnectedTransport {
-            mut input_send,
+            input_socket,
             output_socket,
             engines,
             ..
@@ -665,7 +720,7 @@ mod tests {
         };
         let payload = encode_msgpack(&request).unwrap();
         send_message(
-            &mut input_send,
+            &input_socket,
             &engine_id,
             EngineCoreRequestType::Add.to_frame(),
             Bytes::from(payload),
@@ -1020,13 +1075,7 @@ mod tests {
         // and its READY, then its registration, arrive at the new handshake.
         let (transport, engine) = tokio::join!(
             connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
-            async {
-                engine
-                    .redial(&handshake)
-                    .await?
-                    .ready(default_ready_response())
-                    .await
-            },
+            engine.ready(default_ready_response()),
         );
         let transport = transport.expect("the second handshake takes the engine");
         engine.expect("mock engine connected");

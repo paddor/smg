@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use futures::{channel::mpsc::channel as monitor_channel, FutureExt, SinkExt, StreamExt};
-use zeromq::{util::PeerIdentity, Endpoint, SocketEvent};
 
 use super::*;
 use crate::{
@@ -22,7 +21,7 @@ use crate::{
             stats::SchedulerStats,
         },
     },
-    transport::{connect_handshake, ENGINE_CORE_DEAD_SENTINEL},
+    transport::{connect_handshake, PeerEvent, ENGINE_CORE_DEAD_SENTINEL},
 };
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -2029,10 +2028,38 @@ fn large_request(request_id: &str) -> (EngineCoreRequest, Vec<Bytes>) {
     (request, Vec::new())
 }
 
+/// More messages than a mock engine's input socket reads ahead of it.
+const ENGINE_READ_AHEAD: usize = 64;
+
+/// Fill a mock engine's read-ahead with copies of a small add, so large
+/// frames queued after them stay with the socket.
+fn fill_read_ahead<P: EngineProtocol>(client: &Client<P>, add_frame: &Bytes, payload: &[u8]) {
+    for _ in 0..ENGINE_READ_AHEAD {
+        client
+            .inner
+            .queue_frame(
+                &EngineId::from_engine_index(0),
+                add_frame.clone(),
+                payload.to_vec(),
+                Vec::new(),
+                None,
+                None,
+            )
+            .unwrap();
+    }
+}
+
 /// Queue large frames until our ownership budget stalls the writer, without
-/// depending on the upstream's private channel capacity. No engine reads.
+/// depending on how many frames the socket and the engine's read-ahead take
+/// first: small frames fill the read-ahead, so the large ones stay with the
+/// socket. No engine reads.
 async fn saturate_input(client: &EngineCoreClient) {
-    for _ in 0..3 {
+    fill_read_ahead(
+        client,
+        &VllmProtocol::add_frame(),
+        &encode_msgpack(&request_for("queue-saturation", 0)).unwrap(),
+    );
+    for _ in 0..4 {
         let (request, aux) = large_request("queue-saturation");
         client
             .inner
@@ -2045,22 +2072,25 @@ async fn saturate_input(client: &EngineCoreClient) {
                 None,
             )
             .unwrap();
-    }
-    tokio::time::timeout(TIMEOUT, async {
-        loop {
-            if client
-                .inner
-                .writing_since
-                .lock()
-                .is_some_and(|since| since.elapsed() >= Duration::from_millis(50))
-            {
-                break;
+        let stalled = tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                if client
+                    .inner
+                    .writing_since
+                    .lock()
+                    .is_some_and(|since| since.elapsed() >= Duration::from_millis(50))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        })
+        .await;
+        if stalled.is_ok() {
+            return;
         }
-    })
-    .await
-    .expect("transport-owned payload budget becomes full");
+    }
+    panic!("transport-owned payload budget becomes full");
 }
 
 /// The byte bound of a case whose large submit must be queued behind the
@@ -2223,6 +2253,11 @@ async fn input_budget_tracks_frame_owners_and_cancelled_reservations() {
 async fn a_stalled_peer_cannot_bypass_the_transport_byte_budget() {
     let (client, engine, _ns) = connect().await;
     client.set_send_timeout(SEND_WINDOW);
+    fill_read_ahead(
+        &client,
+        &VllmProtocol::add_frame(),
+        &encode_msgpack(&request_for("read-ahead", 0)).unwrap(),
+    );
     let (request, aux) = large_request("codec-blocker");
     let mut streams = vec![client.submit_with_aux(request, aux).await.unwrap()];
     let mut blocked = false;
@@ -2247,8 +2282,11 @@ async fn a_stalled_peer_cannot_bypass_the_transport_byte_budget() {
         "the byte budget must apply before 32 payloads are admitted"
     );
     assert!(client.is_alive());
+    // The socket keeps a payload until it is written: either the blocker
+    // alone, the one oversized frame the budget admits, or at most 32 MiB of
+    // the others once the blocker left.
     let bytes = client.inner.input_budget.used.lock().bytes;
-    assert!(bytes > 0 && bytes <= ENGINE_INPUT_QUEUE_BYTES);
+    assert!(bytes > 0 && (bytes <= ENGINE_INPUT_QUEUE_BYTES || streams.len() == 1));
     assert!(streams.len() <= 17, "at most 32 MiB plus the codec blocker");
     drop(streams);
     assert_eq!(client.inner.input_budget.used.lock().bytes, bytes);
@@ -2357,12 +2395,12 @@ async fn a_disconnect_queued_before_the_link_was_admitted_does_not_end_it() {
     // previous generation's connection and the admitted one: its accept, its
     // end, then the accept of the connection that carried the registration,
     // all queued when the client is built.
-    let own = PeerIdentity::try_from(EngineId::from_engine_index(0)).unwrap();
+    let own = EngineId::from_engine_index(0).to_frame();
     let (mut events, replay) = monitor_channel(8);
     for event in [
-        SocketEvent::Accepted(Endpoint::Ipc(None), own.clone()),
-        SocketEvent::Disconnected(own.clone()),
-        SocketEvent::Accepted(Endpoint::Ipc(None), own.clone()),
+        PeerEvent::Admitted(own.clone()),
+        PeerEvent::Disconnected(own.clone()),
+        PeerEvent::Admitted(own.clone()),
     ] {
         events.try_send(event).unwrap();
     }
@@ -2373,14 +2411,14 @@ async fn a_disconnect_queued_before_the_link_was_admitted_does_not_end_it() {
     assert!(client.is_alive());
 
     // After the admission: a peer that is not an engine of this link.
-    let other = PeerIdentity::try_from(EngineId::from_engine_index(7)).unwrap();
-    events.send(SocketEvent::Disconnected(other)).await.unwrap();
+    let other = EngineId::from_engine_index(7).to_frame();
+    events.send(PeerEvent::Disconnected(other)).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     round_trip(&client, &mut engine, "after-another-peers-disconnect").await;
     assert!(client.is_alive());
 
     // After the admission: this link's engine.
-    events.send(SocketEvent::Disconnected(own)).await.unwrap();
+    events.send(PeerEvent::Disconnected(own)).await.unwrap();
     tokio::time::timeout(TIMEOUT, async {
         while client.is_alive() {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2492,13 +2530,13 @@ async fn an_engine_lost_while_the_handshake_waited_for_the_others_ends_the_link(
     let mut transport = transport.unwrap();
     let (_first, _second) = (first.unwrap(), second.unwrap());
 
-    let lost = PeerIdentity::try_from(EngineId::from_engine_index(0)).unwrap();
-    let other = PeerIdentity::try_from(EngineId::from_engine_index(1)).unwrap();
+    let lost = EngineId::from_engine_index(0).to_frame();
+    let other = EngineId::from_engine_index(1).to_frame();
     let (mut events, replay) = monitor_channel(8);
     for event in [
-        SocketEvent::Accepted(Endpoint::Ipc(None), lost.clone()),
-        SocketEvent::Disconnected(lost),
-        SocketEvent::Accepted(Endpoint::Ipc(None), other),
+        PeerEvent::Admitted(lost.clone()),
+        PeerEvent::Disconnected(lost),
+        PeerEvent::Admitted(other),
     ] {
         events.try_send(event).unwrap();
     }
@@ -2584,7 +2622,7 @@ async fn a_small_request_to_a_frozen_engine_waits_and_is_served_on_resume() {
     assert!(client.is_alive());
 }
 
-/// A frame waiting behind a full zeromq peer queue
+/// A frame waiting behind a full peer queue
 /// fails its own request once the send window passes, and nothing else:
 /// the client stays up, the request already in flight keeps its stream,
 /// a request behind the blocked one fails within the window too instead
@@ -3425,6 +3463,10 @@ async fn an_abandoned_typed_tensor_submit_aborts_its_request_on_the_tagged_wire(
     // The large submit must be queued behind the stalled writer however
     // late it starts: see `QUEUED_SUBMIT_BYTES`.
     client.set_input_queue_limit(usize::MAX, QUEUED_SUBMIT_BYTES);
+    let mut small = large_tagged_request("queue-saturation");
+    small.multimodal_inputs = None;
+    let (payload, _) = TokenSpeedProtocol::encode_add(&small, &Default::default()).unwrap();
+    fill_read_ahead(&client, &TokenSpeedProtocol::add_frame(), &payload);
     for _ in 0..3 {
         let (payload, aux) = TokenSpeedProtocol::encode_add(
             &large_tagged_request("queue-saturation"),

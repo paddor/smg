@@ -1,4 +1,6 @@
-//! Regression for zeromq/zmq.rs#249 at the Runtime::block_on entry point.
+//! Receives of large frames and of many-part messages on the transport's socket
+//! library: a large frame lets the runtime run other work, and a cancelled
+//! receive loses nothing.
 use std::{
     process::Command,
     thread,
@@ -6,12 +8,12 @@ use std::{
 };
 
 use bytes::Bytes;
-use zeromq::{Socket, SocketRecv, SocketSend};
+use omq_tokio::{Message, Options, Socket, SocketType};
 
 /// Bound the regression externally because a spinning poll prevents Tokio timeouts.
 #[test]
 fn large_frame_receive_yields() {
-    const CHILD: &str = "SMG_ZMQ_FAIR_QUEUE_CHILD";
+    const CHILD: &str = "SMG_TRANSPORT_RECEIVE_CHILD";
     if let Some(marker) = std::env::var_os(CHILD) {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -25,7 +27,7 @@ fn large_frame_receive_yields() {
 
     let marker_dir = tempfile::tempdir().unwrap();
     let marker = marker_dir.path().join("done");
-    // Tokio timeouts cannot stop a FairQueue poll that spins forever.
+    // Tokio timeouts cannot stop a receive poll that spins forever.
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "large_frame_receive_yields", "--nocapture"])
         .env(CHILD, &marker)
@@ -50,11 +52,16 @@ fn large_frame_receive_yields() {
     }
 }
 
+/// A PULL socket that takes messages of any part count, as the transport's are.
+fn pull() -> Socket {
+    Socket::new(SocketType::Pull, Options::default().max_message_parts(None))
+}
+
 /// This transport regression deliberately uses Tokio directly, without SMG task wrappers.
 #[expect(clippy::disallowed_methods, clippy::unwrap_used)]
 async fn receive_large_frames() {
     const SIZE: usize = 64 * 1024 * 1024;
-    let mut receiver = zeromq::PullSocket::new();
+    let receiver = pull();
     let endpoint = receiver
         .bind("tcp://127.0.0.1:0")
         .await
@@ -62,12 +69,12 @@ async fn receive_large_frames() {
         .to_string();
     let mut senders = Vec::new();
     for peer in 0..2u8 {
-        let mut sender = zeromq::PushSocket::new();
+        let sender = Socket::new(SocketType::Push, Options::default());
         sender.connect(&endpoint).await.unwrap();
         senders.push(tokio::spawn(async move {
             for _ in 0..2 {
                 sender
-                    .send(Bytes::from(vec![peer; SIZE]).into())
+                    .send(Message::single(vec![peer; SIZE]))
                     .await
                     .unwrap();
             }
@@ -105,13 +112,13 @@ async fn receive_large_frames() {
 /// Cancel an idle receive, then preserve empty/multipart frames and the next message.
 #[tokio::test]
 async fn cancelled_receive_preserves_multipart_and_following_message() {
-    let mut receiver = zeromq::PullSocket::new();
+    let receiver = pull();
     let endpoint = receiver
         .bind("tcp://127.0.0.1:0")
         .await
         .unwrap()
         .to_string();
-    let mut sender = zeromq::PushSocket::new();
+    let sender = Socket::new(SocketType::Push, Options::default());
     sender.connect(&endpoint).await.unwrap();
     assert!(
         tokio::time::timeout(Duration::from_millis(20), receiver.recv())
@@ -127,7 +134,7 @@ async fn cancelled_receive_preserves_multipart_and_following_message() {
             }
         })
         .collect();
-    let message = zeromq::ZmqMessage::try_from(frames.clone()).unwrap();
+    let message = Message::multipart(frames.clone());
     let (sent, received) = tokio::join!(sender.send(message), receiver.recv());
     sent.unwrap();
     let received = received.unwrap();
@@ -136,12 +143,9 @@ async fn cancelled_receive_preserves_multipart_and_following_message() {
         assert_eq!(received.get(index).unwrap(), frame);
     }
     let (sent, received) = tokio::join!(
-        sender.send(Bytes::from_static(b"following").into()),
+        sender.send(Message::single(Bytes::from_static(b"following"))),
         receiver.recv()
     );
     sent.unwrap();
-    assert_eq!(
-        received.unwrap().get(0).unwrap(),
-        &Bytes::from_static(b"following")
-    );
+    assert_eq!(received.unwrap().get(0).unwrap(), b"following");
 }

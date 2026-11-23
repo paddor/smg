@@ -31,7 +31,7 @@ pub enum Error {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("transport error: {0}")]
-    Transport(#[from] zeromq::ZmqError),
+    Transport(#[from] omq_tokio::Error),
     #[error("engine core reported fatal failure")]
     EngineCoreDead,
     #[error("startup handshake timed out while waiting for {stage} after {timeout:?}")]

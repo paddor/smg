@@ -27,6 +27,7 @@ use std::{
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
+use omq_tokio::Socket;
 use parking_lot::Mutex;
 use tokio::{
     sync::{mpsc, oneshot, Notify},
@@ -34,7 +35,6 @@ use tokio::{
     time::Instant,
 };
 use tracing::{info, trace, warn};
-use zeromq::{RouterSendHalf, SocketRecv};
 
 use crate::{
     codec::{FrameStr, OpaqueValue},
@@ -44,7 +44,9 @@ use crate::{
         trtllm::TrtllmProtocol, vllm::VllmProtocol, EngineBatch, EngineLoad, EngineOutput,
         EngineProtocol, UtilityReply, WaveEvent,
     },
-    transport::{run_output_loop, send_message, ConnectedEngine, ConnectedTransport, EngineId},
+    transport::{
+        run_output_loop, send_message, ConnectedEngine, ConnectedTransport, EngineId, PeerEvent,
+    },
 };
 
 /// The vLLM EngineCore connector (the original engine surface).
@@ -566,7 +568,7 @@ struct InputQueueLimit {
     bytes: usize,
 }
 
-/// Logical payloads still owned by zeromq, including its pending writer message.
+/// Logical payloads still owned by the socket, including its pending writer message.
 /// Codec/kernel buffers are separate; an oversized message may occupy an empty
 /// budget alone, preserving support for tensors larger than the byte limit.
 #[derive(Default)]
@@ -593,7 +595,7 @@ impl Drop for InputCredit {
     }
 }
 
-/// Carry queue credit through zeromq's Bytes clones without copying the payload.
+/// Carry queue credit through the socket's Bytes clones without copying the payload.
 struct BudgetedBytes {
     bytes: Bytes,
     _credit: Arc<InputCredit>,
@@ -621,7 +623,7 @@ struct ClientInner<P: EngineProtocol> {
     /// input writer ([`run_input_writer`]) owns the socket and writes them one
     /// at a time, so a caller that stopped waiting never cancels a write.
     input_tx: mpsc::UnboundedSender<InputFrame>,
-    /// How long a caller waits for local zeromq queue admission:
+    /// How long a caller waits for local socket queue admission:
     /// [`ENGINE_SEND_TIMEOUT`] unless [`Client::set_send_timeout`] changed it.
     send_timeout: Mutex<Duration>,
     /// How long queue admission may stall before the client closes:
@@ -632,7 +634,7 @@ struct ClientInner<P: EngineProtocol> {
     /// [`ENGINE_INPUT_QUEUE_BYTES`] unless [`Client::set_input_queue_limit`]
     /// changed it.
     input_queue_limit: Mutex<InputQueueLimit>,
-    /// Separate bounded allowance for payload references handed to zeromq.
+    /// Separate bounded allowance for payload references handed to the socket.
     input_budget: Arc<InputBudget>,
     /// Add-request frames waiting in the input queue (not the one being
     /// written) and their payload bytes, for the bound.
@@ -860,7 +862,7 @@ impl<P: EngineProtocol> ClientInner<P> {
         }
     }
 
-    /// Queue a frame in submission order and wait for local zeromq admission.
+    /// Queue a frame in submission order and wait for local socket admission.
     /// Completion is not a transport flush or engine acknowledgement. Once the
     /// transport-owned payload budget fills, the send timeout fails this request while the
     /// independent writer continues; the input-death timeout closes the client
@@ -895,7 +897,7 @@ impl<P: EngineProtocol> ClientInner<P> {
     }
 
     /// Admit an add-request of `bytes` to the input queue. Free while the
-    /// zeromq accepts frames locally; once admission has stalled for a whole
+    /// The socket accepts frames locally; once admission has stalled for a whole
     /// send window (the transport-owned payload budget is full), a request that would take the waiting
     /// add-requests past the queue bound is refused at once with
     /// [`Error::EngineInputFull`]: it is better served elsewhere than parked
@@ -943,7 +945,7 @@ impl<P: EngineProtocol> ClientInner<P> {
         })
     }
 
-    /// Queue a frame and wait for local zeromq admission; `counted` is the
+    /// Queue a frame and wait for local socket admission; `counted` is the
     /// payload size the queue bound tracks for an add-request.
     async fn send_frame(
         &self,
@@ -1306,15 +1308,14 @@ pub struct Client<P: EngineProtocol> {
 impl<P: EngineProtocol> Client<P> {
     /// Build a client over a connected transport, spawning the input writer,
     /// the output loop and the dispatcher. Background tasks are aborted when
-    /// the client is dropped, but already admitted zeromq frames may still arrive.
+    /// the client is dropped, but already admitted frames may still arrive.
     /// Transport-owned payloads have a separate allowance with the same limits.
     /// Codec and kernel buffers are not included in either allowance.
     pub fn new(transport: ConnectedTransport) -> Self {
         let ConnectedTransport {
             engines,
-            input_send,
+            input_socket,
             mut input_events,
-            mut input_recv,
             output_socket,
             ..
         } = transport;
@@ -1384,17 +1385,16 @@ impl<P: EngineProtocol> Client<P> {
         let mut gone: HashSet<Bytes> = HashSet::new();
         while let Ok(event) = input_events.try_recv() {
             match event {
-                zeromq::SocketEvent::Accepted(_, peer) => {
-                    gone.remove(&peer[..]);
+                PeerEvent::Admitted(peer) => {
+                    gone.remove(&peer);
                 }
-                zeromq::SocketEvent::Disconnected(peer) => {
+                PeerEvent::Disconnected(peer) => {
                     info!(
                         ?peer,
                         "an input peer disconnected before this link was admitted"
                     );
-                    gone.insert(Bytes::from(peer));
+                    gone.insert(peer);
                 }
-                _ => {}
             }
         }
         let lost_at_admission = inner
@@ -1412,18 +1412,19 @@ impl<P: EngineProtocol> Client<P> {
         )]
         let input_task = tokio::spawn(async move {
             tokio::select! {
-                () = run_input_writer::<P>(input_send, input_rx, writer_inner.clone()) => {}
+                () = run_input_writer::<P>(input_socket.clone(), input_rx, writer_inner.clone()) => {}
                 () = async {
-                    // Polling the receive half drives read-side EOF detection even
-                    // when no more writes are sent to a disconnected engine.
+                    // Engines send nothing on the input socket after their
+                    // registration; drop anything else so it does not fill the
+                    // socket's receive queue.
                     loop {
-                        match input_recv.recv().await {
+                        match input_socket.recv().await {
                             Ok(message) => trace!(
                                 frames = message.len(),
                                 "ignoring unexpected post-registration input message"
                             ),
                             Err(error) => {
-                                warn!(%error, "input receiver ended; idle disconnect detection stopped");
+                                warn!(%error, "input socket receive ended");
                                 break;
                             }
                         }
@@ -1442,7 +1443,7 @@ impl<P: EngineProtocol> Client<P> {
                         return;
                     }
                     while let Some(event) = input_events.next().await {
-                        let zeromq::SocketEvent::Disconnected(peer) = event else {
+                        let PeerEvent::Disconnected(peer) = event else {
                             continue;
                         };
                         // The monitor reports every peer of the shared input
@@ -1504,7 +1505,7 @@ impl<P: EngineProtocol> Client<P> {
         !self.inner.registry.lock().closed
     }
 
-    /// Bound how long a submit, abort or utility call waits for zeromq to
+    /// Bound how long a submit, abort or utility call waits for the socket to
     /// accept its frame in the local peer queue (`ENGINE_SEND_TIMEOUT` by
     /// default). Past it the call fails with [`Error::EngineInputBlocked`];
     /// the frame is still delivered when the engine reads again.
@@ -1512,7 +1513,7 @@ impl<P: EngineProtocol> Client<P> {
         *self.inner.send_timeout.lock() = timeout;
     }
 
-    /// Bound how long admission to a full zeromq peer queue may stall before
+    /// Bound how long admission to a full peer queue may stall before
     /// the engine is treated as dead (`ENGINE_INPUT_DEATH_TIMEOUT` by
     /// default): the requests in flight fail and the client closes.
     pub fn set_input_death_timeout(&self, timeout: Duration) {
@@ -1545,7 +1546,7 @@ impl<P: EngineProtocol> Client<P> {
     /// ones are refused at once with [`Error::EngineInputFull`]
     /// (`ENGINE_INPUT_QUEUE_FRAMES` frames and `ENGINE_INPUT_QUEUE_BYTES`
     /// payload bytes by default). The same limits independently bound frames
-    /// still owned by zeromq. That budget admits one oversized message alone;
+    /// still owned by the socket. That budget admits one oversized message alone;
     /// it is released by transport ownership, never by caller cancellation.
     pub fn set_input_queue_limit(&self, frames: usize, bytes: usize) {
         *self.inner.input_queue_limit.lock() = InputQueueLimit { frames, bytes };
@@ -1918,7 +1919,7 @@ impl<P: EngineProtocol> Drop for PendingUtilityCall<'_, P> {
     }
 }
 
-/// How long a caller waits for local zeromq admission of one request on the
+/// How long a caller waits for local socket admission of one request on the
 /// input socket. A healthy engine drains its input continuously; a frame not
 /// accepted in this window is behind input the engine is not reading, and the
 /// caller's request fails with [`Error::EngineInputBlocked`] while the frame
@@ -1992,7 +1993,7 @@ pub const ENGINE_PREFILL_TOKENS_PER_SEC: u64 = 2_000;
 /// a smaller one gives up on a late add sooner.
 const DRAIN_REWAKES_PER_PROMPT: u8 = 3;
 
-/// How long local admission to a full zeromq peer queue may stall before the
+/// How long local admission to a full peer queue may stall before the
 /// engine is treated as dead. A pause the send window outlasts fails the
 /// requests that arrive during it, and only them; a core that has read nothing
 /// for this long is hung, not pausing, and the client closes so health checks
@@ -2011,7 +2012,7 @@ const ENGINE_INPUT_RETAINED_BYTES: usize = 8usize.saturating_mul(1 << 30);
 /// at once instead of parking its payload for the death window (a gateway that
 /// retries every send window would otherwise grow the queue for as long as the
 /// engine does not read). A separate allowance with these same limits covers
-/// payload references still owned by zeromq, including control messages. It
+/// payload references still owned by the socket, including control messages. It
 /// admits an oversized message only when empty. Codec/kernel buffers remain
 /// outside these logical budgets; this is not an allocator/RSS limit. Control
 /// frames bypass the waiting-Add limit but not the transport-owned allowance.
@@ -2274,12 +2275,12 @@ async fn run_dispatcher<P: EngineProtocol>(
     dispatcher.stream_ended();
 }
 
-/// Admit frames to zeromq's local peer queue in FIFO order. Accepted frames
+/// Admit frames to the socket's local peer queue in FIFO order. Accepted frames
 /// can remain in its background writer after this task or the client stops.
 /// The input-death timeout bounds stalled admission to a full peer queue;
 /// the input monitor separately detects asynchronous transport failures.
 async fn run_input_writer<P: EngineProtocol>(
-    mut input_send: RouterSendHalf,
+    input_socket: Socket,
     mut frames: mpsc::UnboundedReceiver<InputFrame>,
     inner: Arc<ClientInner<P>>,
 ) {
@@ -2294,7 +2295,7 @@ async fn run_input_writer<P: EngineProtocol>(
             let bytes = frame.retained.bytes;
             let credit = inner.reserve_input(bytes).await;
             send_message(
-                &mut input_send,
+                &input_socket,
                 &frame.engine_id,
                 credit.wrap(frame.request_type),
                 credit.wrap(frame.payload),
@@ -2314,7 +2315,7 @@ async fn run_input_writer<P: EngineProtocol>(
             Err(_elapsed) => {
                 warn!(
                     timeout = ?death_timeout,
-                    "local zeromq admission stalled for the whole death window; \
+                    "local socket admission stalled for the whole death window; \
                      treating engine as dead"
                 );
                 inner
@@ -2334,7 +2335,7 @@ async fn run_input_writer<P: EngineProtocol>(
             if refused > 0 {
                 warn!(
                     refused,
-                    "zeromq accepted a frame locally again; requests were refused while admission was \
+                    "the socket accepted a frame locally again; requests were refused while admission was \
                      blocked and the queue at the bound"
                 );
             }

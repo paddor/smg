@@ -35,7 +35,7 @@ half.workspace = true
 memchr.workspace = true
 
 # Transport + async runtime.
-zeromq.workspace = true
+omq-tokio.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time", "net", "macros"] }
 futures.workspace = true
 parking_lot.workspace = true
