@@ -26,10 +26,9 @@
 //! warm engine is not blind until eviction; `SMG_KV_EVENT_RELAY_START=lazy`
 //! defers the subscription to the first `SubscribeKvEvents` for a
 //! memory-constrained host). The servicer starts minutes before the engine
-//! binds its publisher, so the relay knocks on the endpoint's port every
-//! second (`DIAL_INTERVAL`, a plain connect) until it is bound, then joins
-//! over ZMQ, and the subscription lands within a second of the bind, before
-//! the engine's handshake; the lifecycle owner
+//! binds its publisher; its SUB socket dials again every 100 ms until the
+//! publisher is bound, so the subscription lands right after the bind,
+//! before the engine's handshake; the lifecycle owner
 //! reads [`KvEventRelay::subscribed`] and holds its planned warm-up until
 //! then, so the warm-up's batches are the first the history records. The
 //! relay keeps what it relays in a bounded [`History`]
@@ -154,14 +153,11 @@ use std::{
 
 use engine_zmq_client::codec::TrailingTolerant;
 use futures::stream;
+use omq_tokio::{Message, Options, Socket, SocketType};
 use smg_grpc_client::common_proto::{self as common};
 use tokio::sync::{broadcast, Notify};
 use tonic::Status;
 use tracing::{debug, error, info, warn};
-use zeromq::{
-    prelude::{Socket, SocketRecv, SocketSend},
-    DealerSocket, Endpoint, SocketOptions, SubSocket, ZmqError, ZmqMessage,
-};
 
 use crate::{
     engine_link::EngineLink,
@@ -205,22 +201,9 @@ const DEFAULT_REPLAY_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often the start replay is retried while the engine's replay socket
 /// does not answer yet.
 const PRIME_RETRY: Duration = Duration::from_secs(1);
-/// How often the relay knocks on a publisher's port that nobody has bound
-/// yet. The relay dials at the servicer's start, minutes before the engine
-/// binds its publisher, and the ZMQ crate retries a refused port with a
-/// back-off that grows to 30 s: longer than a planned warm-up, so left to it
-/// the subscription would land at a random point of that cadence and miss
-/// the warm-up's batches and its closing clear. Knocking every second (a
-/// plain connect, no ZMQ handshake) and joining as soon as the port answers,
-/// the subscription lands within a second of the bind.
-const DIAL_INTERVAL: Duration = Duration::from_secs(1);
-/// How long a publisher whose port answered may take to complete the ZMQ
-/// handshake (the crate's own default); a slower one is logged and dialled
-/// again, so a starved or distant publisher is visible, never silently
-/// re-dialled.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
-/// A debug line every this many knocks on a port nobody has bound.
-const KNOCKS_PER_LOG: u64 = 60;
+/// How often the relay logs that a publisher is still not bound while its
+/// SUB socket dials it.
+const DIAL_LOG_INTERVAL: Duration = Duration::from_secs(60);
 /// Live batches a slow subscriber may fall behind before it is refilled from
 /// the history.
 const LIVE_CHANNEL: usize = 4_096;
@@ -1610,7 +1593,7 @@ async fn run(
     load_source: Arc<OnceLock<Arc<dyn LoadSource>>>,
 ) {
     let source = &config.sources[index];
-    let mut socket = match connect(&source.endpoint, &config.topic).await {
+    let socket = match connect(&source.endpoint, &config.topic).await {
         Ok(socket) => {
             lock(&shared).subscribed += 1;
             socket
@@ -2087,13 +2070,16 @@ async fn replay(
     from: u64,
     timeout: Duration,
 ) -> Result<(Vec<(u64, Vec<u8>)>, bool), String> {
-    let mut dealer = DealerSocket::new();
+    let dealer = Socket::new(SocketType::Dealer, Options::default());
     dealer
         .connect(endpoint)
         .await
         .map_err(|error| format!("could not connect to replay {endpoint}: {error}"))?;
-    let mut request = ZmqMessage::from(Vec::new());
-    request.push_back(from.to_be_bytes().to_vec().into());
+    dealer
+        .wait_connected(1, timeout)
+        .await
+        .map_err(|error| format!("could not connect to replay {endpoint}: {error}"))?;
+    let request = Message::multipart([Vec::new(), from.to_be_bytes().to_vec()]);
     dealer
         .send(request)
         .await
@@ -2125,108 +2111,59 @@ async fn replay(
         let (Some(sequence), Some(payload)) = (sequence, payload) else {
             return Err(format!("malformed replay reply from {endpoint}"));
         };
-        if sequence.as_ref() == &END_SEQUENCE[..] {
+        if sequence == &END_SEQUENCE[..] {
             return Ok((replies, true));
         }
         if sequence.len() != 8 {
             return Err(format!("malformed replay sequence from {endpoint}"));
         }
-        replies.push((low64_big_endian(sequence.as_ref()), payload.to_vec()));
-    }
-}
-
-/// Whether `endpoint`'s port (or socket path) answers a plain connect, which
-/// is the publisher being bound; no ZMQ handshake, so the knock's cadence
-/// alone decides how soon after the bind the join lands.
-async fn port_answers(endpoint: &Endpoint) -> bool {
-    match endpoint {
-        Endpoint::Tcp(host, port) => {
-            let connect = tokio::net::TcpStream::connect((host.to_string(), *port));
-            tokio::time::timeout(DIAL_INTERVAL, connect)
-                .await
-                .is_ok_and(|connected| connected.is_ok())
-        }
-        #[cfg(unix)]
-        Endpoint::Ipc(Some(path)) => engine_zmq_adapter::knock_ipc_socket(path).await.is_ok(),
-        // Nothing to knock on (the enum is non-exhaustive): the ZMQ connect
-        // below says what is wrong.
-        _ => true,
+        replies.push((low64_big_endian(sequence), payload.to_vec()));
     }
 }
 
 /// A SUB socket subscribed to `topic` and connected to `endpoint`. The
-/// subscription is recorded first and sent on connect (and on the crate's
-/// reconnects), as libzmq does. A publisher not bound yet (the engine is
-/// still starting) is knocked on every [`DIAL_INTERVAL`] until its port
-/// answers, then joined under [`HANDSHAKE_TIMEOUT`], so the join follows the
-/// bind within a second instead of the crate's own back-off, which reaches
-/// 30 s; a handshake that does not complete in time is logged and the dial
-/// starts over; any other failure is final.
-async fn connect(endpoint: &str, topic: &str) -> Result<SubSocket, Status> {
+/// subscription is recorded first and sent on every connect, as libzmq does.
+/// A publisher not bound yet (the engine is still starting) is dialled again
+/// every 100 ms, so the join follows the bind at once; until then a debug
+/// line says so every [`DIAL_LOG_INTERVAL`].
+async fn connect(endpoint: &str, topic: &str) -> Result<Socket, Status> {
     let started = Instant::now();
-    let failed = |step: &str, error: ZmqError| {
+    let failed = |step: &str, error: omq_tokio::Error| {
         Status::internal(format!("SubscribeKvEvents: {step} {endpoint}: {error}"))
     };
-    let parsed: Endpoint = endpoint
-        .parse()
-        .map_err(|error| failed("could not dial", ZmqError::Endpoint(error)))?;
-    let mut knocks: u64 = 0;
-    let mut handshakes_timed_out: u64 = 0;
-    loop {
-        while !port_answers(&parsed).await {
-            knocks += 1;
-            if knocks.is_multiple_of(KNOCKS_PER_LOG) {
-                debug!(
-                    %endpoint,
-                    knocks,
-                    waited_secs = started.elapsed().as_secs(),
-                    "SubscribeKvEvents: the publisher's port is not bound yet; still dialling"
-                );
-            }
-            tokio::time::sleep(DIAL_INTERVAL).await;
-        }
-        let mut options = SocketOptions::default();
-        options.connect_timeout(HANDSHAKE_TIMEOUT);
-        let mut socket = SubSocket::with_options(options);
-        socket
-            .subscribe(topic)
-            .await
-            .map_err(|error| failed("could not subscribe to", error))?;
-        match socket.connect(endpoint).await {
-            Ok(()) => {
-                info!(
-                    %endpoint,
-                    knocks,
-                    handshakes_timed_out,
-                    dialled_secs = started.elapsed().as_secs_f64(),
-                    "SubscribeKvEvents: connected to ZMQ endpoint"
-                );
-                return Ok(socket);
-            }
-            Err(ZmqError::ConnectTimeout(budget)) => {
-                handshakes_timed_out += 1;
-                warn!(
-                    %endpoint,
-                    ?budget,
-                    handshakes_timed_out,
-                    "SubscribeKvEvents: the publisher's port answered but the ZMQ handshake did \
-                     not complete in time; dialling again"
-                );
-            }
-            Err(error) => return Err(failed("could not connect to", error)),
-        }
+    let socket = Socket::new(SocketType::Sub, Options::default());
+    socket
+        .subscribe(topic.to_string())
+        .await
+        .map_err(|error| failed("could not subscribe to", error))?;
+    socket
+        .connect(endpoint)
+        .await
+        .map_err(|error| failed("could not dial", error))?;
+    while socket.wait_connected(1, DIAL_LOG_INTERVAL).await.is_err() {
+        debug!(
+            %endpoint,
+            waited_secs = started.elapsed().as_secs(),
+            "SubscribeKvEvents: the publisher is not bound yet; still dialling"
+        );
     }
+    info!(
+        %endpoint,
+        dialled_secs = started.elapsed().as_secs_f64(),
+        "SubscribeKvEvents: connected to ZMQ endpoint"
+    );
+    Ok(socket)
 }
 
 /// A publisher message's `[topic, sequence, payload, ...]` as the sequence
 /// number and payload, or `None` for fewer than three frames.
-fn split_frames(message: &ZmqMessage) -> Option<(u64, &[u8])> {
+fn split_frames(message: &Message) -> Option<(u64, &[u8])> {
     if message.len() < 3 {
         return None;
     }
     let sequence = message.get(1)?;
     let payload = message.get(2)?;
-    Some((low64_big_endian(sequence), payload.as_ref()))
+    Some((low64_big_endian(sequence), payload))
 }
 
 /// Golden publisher payloads encoded by vLLM 0.30.1rc1 (msgspec 0.22) with
@@ -2234,7 +2171,7 @@ fn split_frames(message: &ZmqMessage) -> Option<(u64, &[u8])> {
 /// prints the Python relay's conversion of them (the expected protos below).
 #[cfg(test)]
 pub(crate) mod golden {
-    use zeromq::ZmqMessage;
+    use omq_tokio::Message;
 
     /// `KVEventBatch(ts=1700000000.5, data_parallel_rank=None)` with a
     /// `BlockStored` of two sha256-byte hashes (`00..00 80 00..00`,
@@ -2257,11 +2194,12 @@ pub(crate) mod golden {
     }
 
     /// A publisher message: `[topic, sequence (u64 big-endian), payload]`.
-    pub(crate) fn frame(topic: &[u8], sequence: u64, payload: &[u8]) -> ZmqMessage {
-        let mut message = ZmqMessage::from(topic.to_vec());
-        message.push_back(sequence.to_be_bytes().to_vec().into());
-        message.push_back(payload.to_vec().into());
-        message
+    pub(crate) fn frame(topic: &[u8], sequence: u64, payload: &[u8]) -> Message {
+        Message::multipart([
+            topic.to_vec(),
+            sequence.to_be_bytes().to_vec(),
+            payload.to_vec(),
+        ])
     }
 }
 

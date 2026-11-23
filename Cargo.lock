@@ -2193,6 +2193,7 @@ dependencies = [
  "llm-tokenizer",
  "metrics",
  "metrics-exporter-prometheus",
+ "omq-tokio",
  "openai-protocol",
  "portpicker",
  "prost",
@@ -2211,7 +2212,6 @@ dependencies = [
  "tonic-health",
  "tracing",
  "tracing-subscriber",
- "zeromq",
  "zip",
 ]
 

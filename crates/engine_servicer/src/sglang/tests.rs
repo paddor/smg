@@ -2931,11 +2931,11 @@ async fn hidden_states_are_kept_to_the_schedulers_launch_time_cap() {
 /// numbers, and stopping the servicer closes the subscription.
 #[tokio::test]
 async fn subscribe_kv_events_relays_a_configured_publisher() {
-    use zeromq::{prelude::*, PubSocket, SocketEvent};
+    use omq_tokio::{MonitorEvent, Options, Socket, SocketType};
 
     use crate::kv_events::golden;
 
-    let mut publisher = PubSocket::new();
+    let publisher = Socket::new(SocketType::Pub, Options::default());
     let mut monitor = publisher.monitor();
     let port = bound_port(
         &publisher
@@ -2983,8 +2983,8 @@ async fn subscribe_kv_events_relays_a_configured_publisher() {
     drop(stream);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
     let disconnected = tokio::time::timeout(Duration::from_secs(5), async {
-        while let Some(event) = monitor.next().bounded().await {
-            if matches!(event, SocketEvent::Disconnected(_)) {
+        while let Ok(event) = monitor.recv().bounded().await {
+            if matches!(event, MonitorEvent::Disconnected { .. }) {
                 return true;
             }
         }
@@ -3002,7 +3002,7 @@ async fn subscribe_kv_events_relays_a_configured_publisher() {
 async fn the_relay_subscribes_to_the_publisher_at_boot_before_any_gateway() {
     use crate::testing::{bound_publisher, relay_takes_the_first_two_batches};
 
-    let (mut publisher, endpoint) = bound_publisher().await;
+    let (publisher, endpoint) = bound_publisher().await;
     let mut model = model_info();
     model.kv_events_endpoint = endpoint;
     model.kv_events_topic = "kv".to_string();
@@ -3014,7 +3014,7 @@ async fn the_relay_subscribes_to_the_publisher_at_boot_before_any_gateway() {
         .kv_relay
         .clone()
         .expect("a relay for the publisher");
-    relay_takes_the_first_two_batches(&mut publisher, &relay).await;
+    relay_takes_the_first_two_batches(&publisher, &relay).await;
 
     // The first gateway gets both from the history: the engine's whole state.
     let mut stream = h
@@ -3040,8 +3040,7 @@ async fn the_relay_subscribes_to_the_publisher_at_boot_before_any_gateway() {
 async fn a_publisher_already_counting_when_the_servicer_starts_is_replayed_from_its_start() {
     use crate::testing::{publisher_and_replay_socket, replayed_from_the_publishers_start};
 
-    let (mut publisher, mut router, events_endpoint, replay_endpoint) =
-        publisher_and_replay_socket().await;
+    let (publisher, router, events_endpoint, replay_endpoint) = publisher_and_replay_socket().await;
     let mut model = model_info();
     model.kv_events_endpoint = events_endpoint;
     model.kv_events_replay_endpoint = replay_endpoint;
@@ -3054,7 +3053,7 @@ async fn a_publisher_already_counting_when_the_servicer_starts_is_replayed_from_
         .kv_relay
         .clone()
         .expect("a relay for the publisher");
-    replayed_from_the_publishers_start(&mut publisher, &mut router, &relay).await;
+    replayed_from_the_publishers_start(&publisher, &router, &relay).await;
 
     // The window is the publisher's whole life: the first gateway gets it.
     let mut stream = h
@@ -3321,11 +3320,9 @@ async fn a_shutdown_after_the_engines_completion_ends_the_stream_cleanly() {
 /// per-rank admission cursors expect.
 #[tokio::test]
 async fn every_rank_of_a_data_parallel_publisher_reaches_the_gateway() {
-    use zeromq::prelude::*;
-
     use crate::{kv_events::golden, testing::consecutive_publishers};
 
-    let (base, mut publishers) = consecutive_publishers(2).await;
+    let (base, publishers) = consecutive_publishers(2).await;
     let mut model = model_info();
     model.kv_events_endpoint = format!("tcp://*:{base}");
     model.kv_events_topic = "kv".to_string();
@@ -3342,7 +3339,7 @@ async fn every_rank_of_a_data_parallel_publisher_reaches_the_gateway() {
     // until the relay has taken both (repeats are duplicates).
     let batch2 = golden::bytes(golden::BATCH2);
     for _ in 0..250 {
-        for publisher in &mut publishers {
+        for publisher in &publishers {
             publisher
                 .send(golden::frame(b"kv", 0, &batch2))
                 .await

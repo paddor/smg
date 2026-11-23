@@ -42,7 +42,7 @@ tracing-subscriber.workspace = true
 sha2 = "0.11"
 zip = "9.0"
 # The KV-event relay's SUB socket (vLLM's publisher is plain ZMQ PUB/SUB).
-zeromq.workspace = true
+omq-tokio.workspace = true
 
 [dev-dependencies]
 engine-zmq-client = { workspace = true, features = ["mock-engine"] }

@@ -2252,7 +2252,7 @@ async fn the_launchers_running_window_wins_over_the_handshakes() {
 async fn the_relay_subscribes_to_the_publisher_at_boot_before_any_gateway() {
     use crate::testing::{bound_publisher, relay_takes_the_first_two_batches};
 
-    let (mut publisher, endpoint) = bound_publisher().await;
+    let (publisher, endpoint) = bound_publisher().await;
     let mut model = model_info();
     model.kv_events_endpoint = endpoint;
     model.kv_events_topic = "kv".to_string();
@@ -2264,7 +2264,7 @@ async fn the_relay_subscribes_to_the_publisher_at_boot_before_any_gateway() {
         .kv_relay
         .clone()
         .expect("a relay for the publisher");
-    relay_takes_the_first_two_batches(&mut publisher, &relay).await;
+    relay_takes_the_first_two_batches(&publisher, &relay).await;
 
     // The first gateway gets both from the history: the engine's whole state.
     let mut stream = h
@@ -2699,11 +2699,9 @@ async fn prefill_capacity_reaches_grpc_and_push_per_rank() {
 /// usage and window at every scheduler step.
 #[tokio::test]
 async fn relayed_batches_carry_the_servicers_load_record() {
-    use zeromq::prelude::*;
-
     use crate::testing::bound_publisher;
 
-    let (mut publisher, endpoint) = bound_publisher().await;
+    let (publisher, endpoint) = bound_publisher().await;
     let mut model = model_info();
     model.kv_events_endpoint = endpoint;
     model.kv_events_topic = "kv".to_string();
@@ -2766,8 +2764,7 @@ async fn relayed_batches_carry_the_servicers_load_record() {
 async fn a_publisher_already_counting_when_the_servicer_starts_is_replayed_from_its_start() {
     use crate::testing::{publisher_and_replay_socket, replayed_from_the_publishers_start};
 
-    let (mut publisher, mut router, events_endpoint, replay_endpoint) =
-        publisher_and_replay_socket().await;
+    let (publisher, router, events_endpoint, replay_endpoint) = publisher_and_replay_socket().await;
     let mut model = model_info();
     model.kv_events_endpoint = events_endpoint;
     model.kv_events_replay_endpoint = replay_endpoint;
@@ -2780,7 +2777,7 @@ async fn a_publisher_already_counting_when_the_servicer_starts_is_replayed_from_
         .kv_relay
         .clone()
         .expect("a relay for the publisher");
-    replayed_from_the_publishers_start(&mut publisher, &mut router, &relay).await;
+    replayed_from_the_publishers_start(&publisher, &router, &relay).await;
 
     // The window is the publisher's whole life: the first gateway gets it.
     let mut stream = h
@@ -3092,7 +3089,7 @@ async fn the_relays_rank_record_is_the_get_loads_entry_of_the_rank() {
 /// servicer closes the subscription on the publisher's side.
 #[tokio::test]
 async fn subscribe_kv_events_relays_a_publisher_or_is_unimplemented() {
-    use zeromq::{prelude::*, PubSocket, SocketEvent};
+    use omq_tokio::{MonitorEvent, Options, Socket, SocketType};
 
     let mut h = harness(model_info(), None).await;
     let status = h
@@ -3105,7 +3102,7 @@ async fn subscribe_kv_events_relays_a_publisher_or_is_unimplemented() {
     assert_eq!(status.message(), kv_events::VLLM_DISABLED_MESSAGE);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 
-    let mut publisher = PubSocket::new();
+    let publisher = Socket::new(SocketType::Pub, Options::default());
     let mut monitor = publisher.monitor();
     let port = bound_port(
         &publisher
@@ -3182,8 +3179,8 @@ async fn subscribe_kv_events_relays_a_publisher_or_is_unimplemented() {
     drop(stream);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
     let disconnected = tokio::time::timeout(Duration::from_secs(5), async {
-        while let Some(event) = monitor.next().bounded().await {
-            if matches!(event, SocketEvent::Disconnected(_)) {
+        while let Ok(event) = monitor.recv().bounded().await {
+            if matches!(event, MonitorEvent::Disconnected { .. }) {
                 return true;
             }
         }

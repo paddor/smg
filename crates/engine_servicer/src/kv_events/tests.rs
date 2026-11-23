@@ -5,9 +5,9 @@ use std::{
 
 use engine_zmq_client::mock_engine::MOCK_DEADLINE;
 use futures::StreamExt;
+use omq_tokio::{Message, MonitorEvent, Options, Socket, SocketType};
 use smg_grpc_client::common_proto::{kv_cache_event, KvCacheLocality, KvCacheTier};
 use tokio::time::timeout;
-use zeromq::{PubSocket, RouterSocket, SocketEvent};
 
 use super::{golden, *};
 use crate::{kv_state::CHUNK_BLOCKS, kv_wire::WireBatch};
@@ -137,9 +137,8 @@ fn relay_dialling(endpoint: &str) -> Arc<KvEventRelay> {
 
 /// The relay dials at the servicer's start, minutes before the engine
 /// binds its publisher: a publisher bound seconds later is joined within
-/// a second of the bind (the relay's own knock every second), not at the
-/// ZMQ crate's own back-off (50 ms doubling to 30 s), which would put the
-/// join after a planned warm-up.
+/// a second of the bind (the SUB socket dials again every 100 ms), not at
+/// a back-off that would put the join after a planned warm-up.
 #[tokio::test]
 async fn a_publisher_bound_after_the_relays_start_is_joined_within_a_second() {
     let endpoint = format!(
@@ -154,7 +153,7 @@ async fn a_publisher_bound_after_the_relays_start_is_joined_within_a_second() {
     // sleeping for seconds between dials.
     tokio::time::sleep(Duration::from_secs(4)).await;
     assert!(!relay.subscribed(), "still nobody bound");
-    let mut publisher = PubSocket::new();
+    let publisher = Socket::new(SocketType::Pub, Options::default());
     publisher.bind(&endpoint).await.expect("publisher binds");
     let bound = Instant::now();
     while !relay.subscribed() {
@@ -373,14 +372,11 @@ fn frames_are_split_like_the_python_relay() {
     assert_eq!(sequence, 5);
     assert_eq!(body, payload.as_slice());
 
-    let mut short = ZmqMessage::from(b"kv".to_vec());
-    short.push_back(5u64.to_be_bytes().to_vec().into());
+    let short = Message::multipart([b"kv".to_vec(), 5u64.to_be_bytes().to_vec()]);
     assert!(split_frames(&short).is_none());
 
     // A shorter sequence frame zero-extends, as `int.from_bytes` does.
-    let mut narrow = ZmqMessage::from(b"kv".to_vec());
-    narrow.push_back(vec![1, 2].into());
-    narrow.push_back(payload.into());
+    let narrow = Message::multipart([b"kv".to_vec(), vec![1, 2], payload]);
     assert_eq!(
         split_frames(&narrow).map(|(sequence, _)| sequence),
         Some(0x0102)
@@ -388,21 +384,21 @@ fn frames_are_split_like_the_python_relay() {
 }
 
 struct Lab {
-    publisher: PubSocket,
-    router: Option<RouterSocket>,
+    publisher: Socket,
+    router: Option<Socket>,
     relay: Arc<KvEventRelay>,
 }
 
 /// A local publisher (and replay ROUTER when asked) with a started relay.
 async fn start_lab(history_batches: usize, with_replay: bool) -> Lab {
-    let mut publisher = PubSocket::new();
+    let publisher = Socket::new(SocketType::Pub, Options::default());
     let endpoint = publisher
         .bind("tcp://127.0.0.1:0")
         .await
         .expect("publisher binds")
         .to_string();
     let (router, replay_endpoint) = if with_replay {
-        let mut router = RouterSocket::new();
+        let router = Socket::new(SocketType::Router, Options::default());
         let endpoint = router
             .bind("tcp://127.0.0.1:0")
             .await
@@ -530,7 +526,7 @@ async fn start_lab_with_loads_at(
     backoff: Duration,
     prime: bool,
 ) -> Lab {
-    let mut publisher = PubSocket::new();
+    let publisher = Socket::new(SocketType::Pub, Options::default());
     let endpoint = publisher
         .bind("tcp://127.0.0.1:0")
         .await
@@ -805,7 +801,7 @@ async fn a_live_batch_is_the_engines_progress_a_duplicate_a_heartbeat_and_a_repl
 /// A relay whose replay socket is not bound yet: the relay keeps asking
 /// for the publisher's start until it is.
 async fn start_lab_without_replay_socket_yet() -> (Lab, String) {
-    let mut publisher = PubSocket::new();
+    let publisher = Socket::new(SocketType::Pub, Options::default());
     let endpoint = publisher
         .bind("tcp://127.0.0.1:0")
         .await
@@ -936,25 +932,29 @@ impl Lab {
     async fn send_replay(&mut self, frames: &[Vec<u8>], replies: &[(u64, Vec<u8>)]) {
         let router = self.router.as_mut().expect("a replay socket");
         for (sequence, payload) in replies {
-            let mut reply = ZmqMessage::from(frames[0].clone());
-            reply.push_back(Vec::new().into());
-            reply.push_back(b"kv".to_vec().into());
-            reply.push_back(sequence.to_be_bytes().to_vec().into());
-            reply.push_back(payload.clone().into());
+            let reply = Message::multipart([
+                frames[0].clone(),
+                Vec::new(),
+                b"kv".to_vec(),
+                sequence.to_be_bytes().to_vec(),
+                payload.clone(),
+            ]);
             router.send(reply).await.expect("reply");
         }
-        let mut end = ZmqMessage::from(frames[0].clone());
-        end.push_back(Vec::new().into());
-        end.push_back(Vec::new().into());
-        end.push_back(END_SEQUENCE.to_vec().into());
-        end.push_back(Vec::new().into());
+        let end = Message::multipart([
+            frames[0].clone(),
+            Vec::new(),
+            Vec::new(),
+            END_SEQUENCE.to_vec(),
+            Vec::new(),
+        ]);
         router.send(end).await.expect("end marker");
     }
 }
 
 /// A replay request's frames (`[identity, empty, start]`), checked to
 /// ask from `start`.
-fn replay_request_frames(request: &ZmqMessage, start: u64) -> Vec<Vec<u8>> {
+fn replay_request_frames(request: &Message, start: u64) -> Vec<Vec<u8>> {
     let frames: Vec<Vec<u8>> = request.iter().map(|frame| frame.to_vec()).collect();
     assert_eq!(frames.len(), 3, "[identity, empty, start]");
     assert_eq!(frames[1], b"");
@@ -1225,8 +1225,7 @@ async fn undecodable_payloads_relay_as_empty_batches() {
     lab.publish(1, b"not msgpack").await;
     let empty = read(&mut stream).await;
     assert_eq!((empty.sequence_number, empty.events.len()), (1, 0));
-    let mut short = ZmqMessage::from(b"kv".to_vec());
-    short.push_back(2u64.to_be_bytes().to_vec().into());
+    let short = Message::multipart([b"kv".to_vec(), 2u64.to_be_bytes().to_vec()]);
     lab.publisher.send(short).await.expect("publish");
     lab.publish(2, &golden::bytes(golden::BATCH2)).await;
     assert_eq!(
@@ -1645,7 +1644,7 @@ async fn the_relay_takes_the_publishers_replay_at_start_before_any_live_batch() 
     // The engine comes up a moment after the servicer: the first attempt
     // found no replay socket, the retry finds it.
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let mut router = RouterSocket::new();
+    let router = Socket::new(SocketType::Router, Options::default());
     router.bind(&replay_endpoint).await.expect("replay binds");
     lab.router = Some(router);
     // The mock counts from 1: sequences 1..=3 went out at registration.
@@ -1736,7 +1735,7 @@ async fn a_start_replay_that_begins_past_the_publishers_start_marks_the_rest_unk
     let mut lab = start_lab_without_replay_socket_yet().await;
     let (lab, replay_endpoint) = (&mut lab.0, lab.1);
     let batch2 = golden::bytes(golden::BATCH2);
-    let mut router = RouterSocket::new();
+    let router = Socket::new(SocketType::Router, Options::default());
     router.bind(&replay_endpoint).await.expect("replay binds");
     lab.router = Some(router);
     lab.answer_replay(0, &[(6, batch2.clone()), (7, batch2.clone())])
@@ -1771,8 +1770,8 @@ async fn dropping_the_relay_closes_the_publisher_subscription() {
     drop(lab.relay);
     read_end(&mut stream).await;
     let disconnected = timeout(MOCK_DEADLINE, async {
-        while let Some(event) = monitor.next().await {
-            if matches!(event, SocketEvent::Disconnected(_)) {
+        while let Ok(event) = monitor.recv().await {
+            if matches!(event, MonitorEvent::Disconnected { .. }) {
                 return true;
             }
         }
@@ -1785,7 +1784,7 @@ async fn dropping_the_relay_closes_the_publisher_subscription() {
 /// One publisher per rank, as a data-parallel engine runs them, each on
 /// its own port, with a started relay over all of them.
 struct RankLab {
-    publishers: Vec<PubSocket>,
+    publishers: Vec<Socket>,
     relay: Arc<KvEventRelay>,
 }
 
@@ -1814,7 +1813,7 @@ async fn rank_lab(
     let mut publishers = Vec::new();
     let mut sources = Vec::new();
     for rank in 0..ranks {
-        let mut publisher = PubSocket::new();
+        let publisher = Socket::new(SocketType::Pub, Options::default());
         let endpoint = publisher
             .bind("tcp://127.0.0.1:0")
             .await

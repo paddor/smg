@@ -12,7 +12,9 @@ use std::{
     time::Duration,
 };
 
+use bytes::Bytes;
 use engine_zmq_client::mock_engine::MOCK_DEADLINE;
+use omq_tokio::{Message, Options, Socket, SocketType};
 use smg_grpc_client::common_proto::KvEventBatch;
 use tokio::time::timeout;
 use tonic::Streaming;
@@ -89,9 +91,7 @@ pub(crate) fn reported_alive<S: Send + Sync + 'static>(
 /// `count` publishers bound on consecutive ports from the returned base, as
 /// a data-parallel engine lays its ranks' publishers out (rank `r` on the
 /// base port plus `r`).
-pub(crate) async fn consecutive_publishers(count: u16) -> (u16, Vec<zeromq::PubSocket>) {
-    use zeromq::prelude::*;
-
+pub(crate) async fn consecutive_publishers(count: u16) -> (u16, Vec<Socket>) {
     for _ in 0..20 {
         let Some(base) = portpicker::pick_unused_port() else {
             continue;
@@ -104,7 +104,7 @@ pub(crate) async fn consecutive_publishers(count: u16) -> (u16, Vec<zeromq::PubS
         }
         let mut publishers = Vec::with_capacity(usize::from(count));
         for port in base..=last {
-            let mut publisher = zeromq::PubSocket::new();
+            let publisher = Socket::new(SocketType::Pub, Options::default());
             if publisher
                 .bind(&format!("tcp://127.0.0.1:{port}"))
                 .await
@@ -297,10 +297,8 @@ pub(crate) fn bound_port(endpoint: &str) -> u16 {
 
 /// A publisher bound on a free local port for a KV-events relay test, with
 /// the `tcp://*:<port>` endpoint a model info names for it.
-pub(crate) async fn bound_publisher() -> (zeromq::PubSocket, String) {
-    use zeromq::prelude::*;
-
-    let mut publisher = zeromq::PubSocket::new();
+pub(crate) async fn bound_publisher() -> (Socket, String) {
+    let publisher = Socket::new(SocketType::Pub, Options::default());
     let port = bound_port(
         &publisher
             .bind("tcp://127.0.0.1:0")
@@ -333,12 +331,7 @@ pub(crate) fn next_batch(
 /// before any gateway: publishes sequence 0 until the relay, with no
 /// subscriber of its own yet, has taken it (the SUB connect is asynchronous;
 /// repeats are duplicates), then sequence 1, and reads two relayed.
-pub(crate) async fn relay_takes_the_first_two_batches(
-    publisher: &mut zeromq::PubSocket,
-    relay: &KvEventRelay,
-) {
-    use zeromq::prelude::*;
-
+pub(crate) async fn relay_takes_the_first_two_batches(publisher: &Socket, relay: &KvEventRelay) {
     use crate::kv_events::golden;
 
     let batch1 = golden::bytes(golden::BATCH1);
@@ -373,12 +366,9 @@ pub(crate) async fn relay_takes_the_first_two_batches(
 /// A publisher and a replay socket bound on free local ports for a KV-events
 /// relay test, with the two `tcp://*:<port>` endpoints a model info names
 /// for them.
-pub(crate) async fn publisher_and_replay_socket(
-) -> (zeromq::PubSocket, zeromq::RouterSocket, String, String) {
-    use zeromq::prelude::*;
-
+pub(crate) async fn publisher_and_replay_socket() -> (Socket, Socket, String, String) {
     let (publisher, pub_endpoint) = bound_publisher().await;
-    let mut router = zeromq::RouterSocket::new();
+    let router = Socket::new(SocketType::Router, Options::default());
     let replay_port = bound_port(
         &router
             .bind("tcp://127.0.0.1:0")
@@ -402,12 +392,10 @@ pub(crate) async fn publisher_and_replay_socket(
 /// first, the start replay or the late join, all four came from the replay
 /// socket and nothing is unknown.
 pub(crate) async fn replayed_from_the_publishers_start(
-    publisher: &mut zeromq::PubSocket,
-    router: &mut zeromq::RouterSocket,
+    publisher: &Socket,
+    router: &Socket,
     relay: &KvEventRelay,
 ) {
-    use zeromq::{prelude::*, ZmqMessage};
-
     use crate::kv_events::golden;
 
     let batch1 = golden::bytes(golden::BATCH1);
@@ -424,26 +412,30 @@ pub(crate) async fn replayed_from_the_publishers_start(
         }
     }
     let request = request.expect("the relay asked the replay socket");
-    let frames: Vec<Vec<u8>> = request.iter().map(|frame| frame.to_vec()).collect();
+    let frames: Vec<Bytes> = request.iter().collect();
     assert_eq!(frames.len(), 3, "[identity, empty, start]");
     assert_eq!(
-        frames[2],
+        frames[2][..],
         0u64.to_be_bytes(),
         "asked from the publisher's start"
     );
     for (sequence, payload) in [(0u64, &batch1), (1, &batch2), (2, &batch2), (3, &batch2)] {
-        let mut reply = ZmqMessage::from(frames[0].clone());
-        reply.push_back(Vec::new().into());
-        reply.push_back(b"kv".to_vec().into());
-        reply.push_back(sequence.to_be_bytes().to_vec().into());
-        reply.push_back(payload.clone().into());
+        let reply = Message::multipart([
+            frames[0].clone(),
+            Bytes::new(),
+            Bytes::from_static(b"kv"),
+            Bytes::copy_from_slice(&sequence.to_be_bytes()),
+            Bytes::from(payload.clone()),
+        ]);
         router.send(reply).await.expect("reply");
     }
-    let mut end = ZmqMessage::from(frames[0].clone());
-    end.push_back(Vec::new().into());
-    end.push_back(Vec::new().into());
-    end.push_back([0xff; 8].to_vec().into());
-    end.push_back(Vec::new().into());
+    let end = Message::multipart([
+        frames[0].clone(),
+        Bytes::new(),
+        Bytes::new(),
+        Bytes::from_static(&[0xff; 8]),
+        Bytes::new(),
+    ]);
     router.send(end).await.expect("end marker");
     for _ in 0..250 {
         if relay.counts().relayed >= 4 {

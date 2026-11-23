@@ -23,9 +23,9 @@ use engine_servicer::kv_events::{
     KvEventRelay, RankSource, RelayConfig, DEFAULT_HISTORY_BATCHES, DEFAULT_HISTORY_BYTES,
 };
 use futures::StreamExt;
+use omq_tokio::{Message, Options, Socket, SocketType};
 use serde_json::json;
 use smg_grpc_client::common_proto;
-use zeromq::{prelude::*, PubSocket, ZmqMessage};
 
 #[global_allocator]
 static GLOBAL: Counting = Counting;
@@ -83,17 +83,14 @@ fn payload(chain: u64) -> Vec<u8> {
     rmp_serde::to_vec_named(&json!([1_700_000_000.0, events, 0])).expect("encodes")
 }
 
-fn frame(seq: u64, body: &[u8]) -> ZmqMessage {
-    let mut message = ZmqMessage::from(b"kv".to_vec());
-    message.push_back(seq.to_be_bytes().to_vec().into());
-    message.push_back(body.to_vec().into());
-    message
+fn frame(seq: u64, body: &[u8]) -> Message {
+    Message::multipart([b"kv".to_vec(), seq.to_be_bytes().to_vec(), body.to_vec()])
 }
 
 /// A relay joined to a publisher of this test's own, with the sequence the
 /// next published batch takes.
 struct Bed {
-    publisher: PubSocket,
+    publisher: Socket,
     relay: Arc<KvEventRelay>,
     next_seq: u64,
     ring: Vec<Vec<u8>>,
@@ -101,7 +98,7 @@ struct Bed {
 
 impl Bed {
     async fn start() -> Self {
-        let mut publisher = PubSocket::new();
+        let publisher = Socket::new(SocketType::Pub, Options::default());
         let endpoint = publisher
             .bind("tcp://127.0.0.1:0")
             .await

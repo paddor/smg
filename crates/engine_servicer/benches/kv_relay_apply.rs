@@ -37,8 +37,8 @@ use engine_servicer::{
     kv_wire::{Normalizer, WireBatch},
 };
 use engine_zmq_client::codec::TrailingTolerant;
+use omq_tokio::{Message, Options, Socket, SocketType};
 use serde_json::json;
-use zeromq::{prelude::*, PubSocket, ZmqMessage};
 
 const RANKS: i32 = 8;
 /// Live blocks per rank: 676,144 / 64 chains of 64 blocks.
@@ -210,7 +210,7 @@ fn relay_over_zmq() {
         .build()
         .expect("runtime");
     runtime.block_on(async {
-        let mut publisher = PubSocket::new();
+        let publisher = Socket::new(SocketType::Pub, Options::default());
         let endpoint = publisher
             .bind("tcp://127.0.0.1:0")
             .await
@@ -232,10 +232,7 @@ fn relay_over_zmq() {
         });
         relay.start();
         let frame = |seq: u64, body: &[u8]| {
-            let mut message = ZmqMessage::from(b"kv".to_vec());
-            message.push_back(seq.to_be_bytes().to_vec().into());
-            message.push_back(body.to_vec().into());
-            message
+            Message::multipart([b"kv".to_vec(), seq.to_be_bytes().to_vec(), body.to_vec()])
         };
         let ring: Vec<Vec<u8>> = (0..512u64).map(|chain| payload(0, chain, None)).collect();
         // The subscription lands a moment after the connect.
