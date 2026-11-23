@@ -41,12 +41,9 @@
 use std::collections::VecDeque;
 
 use futures::StreamExt;
+use omq_tokio::{Message, Options, Socket, SocketType};
 use rmpv::Value;
 use smg_grpc_client::common_proto as common;
-use zeromq::{
-    prelude::{Socket, SocketRecv, SocketSend},
-    PubSocket, RouterSocket, ZmqError, ZmqMessage,
-};
 
 use crate::engine::{unix_seconds, Engine, Place, Published};
 
@@ -101,7 +98,7 @@ fn tcp_endpoint(host: &str, port: u16) -> String {
 /// Bind the sockets and publish the engine's events until its event channel
 /// closes.
 pub(crate) async fn serve(engine: Engine, cfg: KvZmqConfig) {
-    let mut publisher = PubSocket::new();
+    let publisher = Socket::new(SocketType::Pub, Options::default());
     let endpoint = tcp_endpoint(&cfg.host, cfg.port);
     if let Err(e) = publisher.bind(&endpoint).await {
         tracing::error!("kv-events publisher failed to bind {endpoint}: {e}");
@@ -109,7 +106,7 @@ pub(crate) async fn serve(engine: Engine, cfg: KvZmqConfig) {
     }
     let mut replay = None;
     if cfg.replay {
-        let mut router = RouterSocket::new();
+        let router = Socket::new(SocketType::Router, Options::default());
         let replay_endpoint = tcp_endpoint(&cfg.host, cfg.port.saturating_add(1));
         if let Err(e) = router.bind(&replay_endpoint).await {
             tracing::error!("kv-events replay failed to bind {replay_endpoint}: {e}");
@@ -128,12 +125,7 @@ pub(crate) async fn serve(engine: Engine, cfg: KvZmqConfig) {
 }
 
 /// Publish on already-bound sockets (tests bind port 0 and read it back).
-async fn run(
-    engine: Engine,
-    cfg: KvZmqConfig,
-    mut publisher: PubSocket,
-    mut replay: Option<RouterSocket>,
-) {
+async fn run(engine: Engine, cfg: KvZmqConfig, publisher: Socket, replay: Option<Socket>) {
     let mut events = engine.subscribe_published();
     let mut state = Publisher::new(
         cfg.topic.into_bytes(),
@@ -166,9 +158,9 @@ async fn run(
                     }
                 }
             }
-            request = recv_replay(&mut replay) => {
+            request = recv_replay(replay.as_ref()) => {
                 let Ok(request) = request else { continue };
-                let Some(router) = replay.as_mut() else { continue };
+                let Some(router) = replay.as_ref() else { continue };
                 for reply in state.replay(&request) {
                     if let Err(e) = router.send(reply).await {
                         tracing::warn!("kv-events replay send failed: {e}");
@@ -181,7 +173,7 @@ async fn run(
 }
 
 /// The next replay request, or never when replay is off.
-async fn recv_replay(replay: &mut Option<RouterSocket>) -> Result<ZmqMessage, ZmqError> {
+async fn recv_replay(replay: Option<&Socket>) -> Result<Message, omq_tokio::Error> {
     match replay {
         Some(router) => router.recv().await,
         None => std::future::pending().await,
@@ -223,14 +215,14 @@ impl Publisher {
 
     /// Encode `batch`, assign it the next sequence, keep it for replay and
     /// return the PUB message.
-    fn publish(&mut self, batch: &common::KvEventBatch, spans: &[(usize, Vec<u32>)]) -> ZmqMessage {
+    fn publish(&mut self, batch: &common::KvEventBatch, spans: &[(usize, Vec<u32>)]) -> Message {
         let payload = encode_batch(batch, self.dp_rank, self.wire, spans);
         self.keep(payload)
     }
 
     /// Give `payload` the next sequence and keep it for replay: its PUB
     /// message.
-    fn keep(&mut self, payload: Vec<u8>) -> ZmqMessage {
+    fn keep(&mut self, payload: Vec<u8>) -> Message {
         let seq = self.seq;
         self.seq += 1;
         self.buffer.push_back((seq, payload.clone()));
@@ -242,7 +234,7 @@ impl Publisher {
 
     /// [`Self::keep`], the message going to `live` unless a drop hook lost
     /// the batch.
-    fn keep_into(&mut self, payload: Vec<u8>, lost: bool, live: &mut Vec<ZmqMessage>) {
+    fn keep_into(&mut self, payload: Vec<u8>, lost: bool, live: &mut Vec<Message>) {
         let message = self.keep(payload);
         if !lost {
             live.push(message);
@@ -258,7 +250,7 @@ impl Publisher {
     /// first follows, both are numbered and kept in the engine's order, and
     /// then the second goes out first. A batch a drop hook lost is numbered
     /// and kept, not sent.
-    fn released(&mut self, item: &Published) -> Vec<ZmqMessage> {
+    fn released(&mut self, item: &Published) -> Vec<Message> {
         let payload = encode_batch(&item.batch, self.dp_rank, self.wire, &item.spans);
         let mut live = Vec::with_capacity(2);
         match (item.place, self.ahead.take()) {
@@ -295,7 +287,7 @@ impl Publisher {
 
     /// Replies to a replay request as vLLM frames them (see the module doc);
     /// a request without an 8-byte start sequence gets no reply.
-    fn replay(&self, request: &ZmqMessage) -> Vec<ZmqMessage> {
+    fn replay(&self, request: &Message) -> Vec<Message> {
         let frames: Vec<Vec<u8>> = request.iter().map(|f| f.to_vec()).collect();
         let Some((start, routing)) = frames.split_last() else {
             return Vec::new();
@@ -308,41 +300,28 @@ impl Publisher {
         ]);
         let mut replies = Vec::new();
         for (seq, payload) in self.buffer.iter().filter(|(seq, _)| *seq >= start) {
-            let mut message = routed(routing);
+            let mut frames = routing.to_vec();
             if self.wire == Wire::Vllm {
-                message.push_back(self.topic.clone().into());
+                frames.push(self.topic.clone());
             }
-            message.push_back(seq.to_be_bytes().to_vec().into());
-            message.push_back(payload.clone().into());
-            replies.push(message);
+            frames.push(seq.to_be_bytes().to_vec());
+            frames.push(payload.clone());
+            replies.push(Message::multipart(frames));
         }
-        let mut end = routed(routing);
+        let mut end = routing.to_vec();
         if self.wire == Wire::Vllm {
-            end.push_back(Vec::new().into());
+            end.push(Vec::new());
         }
-        end.push_back(END_SEQ.to_vec().into());
-        end.push_back(Vec::new().into());
-        replies.push(end);
+        end.push(END_SEQ.to_vec());
+        end.push(Vec::new());
+        replies.push(Message::multipart(end));
         replies
     }
 }
 
-/// A reply's routing prefix (the request's frames before the start sequence:
-/// the peer identity and the empty delimiter).
-fn routed(routing: &[Vec<u8>]) -> ZmqMessage {
-    let mut message = ZmqMessage::from(routing[0].clone());
-    for frame in &routing[1..] {
-        message.push_back(frame.clone().into());
-    }
-    message
-}
-
 /// A PUB message: `[topic, sequence (u64 big-endian), payload]`.
-fn frame(topic: &[u8], seq: u64, payload: Vec<u8>) -> ZmqMessage {
-    let mut message = ZmqMessage::from(topic.to_vec());
-    message.push_back(seq.to_be_bytes().to_vec().into());
-    message.push_back(payload.into());
-    message
+fn frame(topic: &[u8], seq: u64, payload: Vec<u8>) -> Message {
+    Message::multipart([topic.to_vec(), seq.to_be_bytes().to_vec(), payload])
 }
 
 /// The batch SGLang's scheduler publishes first: a lone `AllBlocksCleared`.
@@ -566,7 +545,6 @@ mod tests {
     /// A relayed store as the hybrid-batch test reads it: the group and the (hash, token count) of every block.
     type RelayedStore = (Option<u32>, Vec<(i64, usize)>);
     use tokio::{sync::mpsc, time::timeout};
-    use zeromq::{DealerSocket, SubSocket};
 
     use super::*;
     use crate::engine::{EngineParams, GenEvent, NewRequest};
@@ -938,39 +916,35 @@ mod tests {
         for _ in 0..5 {
             let message = publisher.publish(&sample_batch(), &[]);
             assert_eq!(message.len(), 3);
-            assert_eq!(message.get(0).map(|t| t.as_ref()), Some(&b"kv"[..]));
+            assert_eq!(message.get(0), Some(&b"kv"[..]));
         }
         assert_eq!(publisher.next_seq(), 5);
 
-        let mut request = ZmqMessage::from(b"peer".to_vec());
-        request.push_back(Vec::new().into());
-        request.push_back(1u64.to_be_bytes().to_vec().into());
+        let request =
+            Message::multipart([b"peer".to_vec(), Vec::new(), 1u64.to_be_bytes().to_vec()]);
         let replies = publisher.replay(&request);
         // The buffer keeps the last three (2, 3, 4); 1 is gone.
         let seqs: Vec<u64> = replies[..replies.len() - 1]
             .iter()
             .map(|m| {
                 assert_eq!(m.len(), 5, "[peer, empty, topic, seq, payload]");
-                assert_eq!(m.get(2).map(|t| t.as_ref()), Some(&b"kv"[..]));
+                assert_eq!(m.get(2), Some(&b"kv"[..]));
                 let seq = m.get(3).expect("seq");
-                u64::from_be_bytes(seq.as_ref().try_into().expect("8 bytes"))
+                u64::from_be_bytes(seq.try_into().expect("8 bytes"))
             })
             .collect();
         assert_eq!(seqs, [2, 3, 4]);
         let end = replies.last().expect("end marker");
         assert_eq!(end.len(), 5, "[peer, empty, empty, END, empty]");
-        assert_eq!(end.get(0).map(|t| t.as_ref()), Some(&b"peer"[..]));
+        assert_eq!(end.get(0), Some(&b"peer"[..]));
         assert!(end.get(2).is_some_and(|f| f.is_empty()));
-        assert_eq!(end.get(3).map(|t| t.as_ref()), Some(&END_SEQ[..]));
+        assert_eq!(end.get(3), Some(&END_SEQ[..]));
         assert!(end.get(4).is_some_and(|f| f.is_empty()));
 
-        let mut late = ZmqMessage::from(b"peer".to_vec());
-        late.push_back(Vec::new().into());
-        late.push_back(99u64.to_be_bytes().to_vec().into());
+        let late = Message::multipart([b"peer".to_vec(), Vec::new(), 99u64.to_be_bytes().to_vec()]);
         assert_eq!(publisher.replay(&late).len(), 1, "only the end marker");
 
-        let mut bad = ZmqMessage::from(b"peer".to_vec());
-        bad.push_back(vec![1, 2, 3, 4].into());
+        let bad = Message::multipart([b"peer".to_vec(), vec![1, 2, 3, 4]]);
         assert!(
             publisher.replay(&bad).is_empty(),
             "a malformed request is ignored"
@@ -992,19 +966,18 @@ mod tests {
     /// replay in order. A second a drop hook lost is kept and not sent.
     #[test]
     fn a_copy_repeats_its_sequence_and_a_swapped_pair_keeps_its_turns() {
-        fn seq_of(message: &ZmqMessage, frame: usize) -> u64 {
+        fn seq_of(message: &Message, frame: usize) -> u64 {
             let seq = message.get(frame).expect("seq");
-            u64::from_be_bytes(seq.as_ref().try_into().expect("8 bytes"))
+            u64::from_be_bytes(seq.try_into().expect("8 bytes"))
         }
         /// The sequences of the messages that went out, in their order.
-        fn sent(messages: &[ZmqMessage]) -> Vec<u64> {
+        fn sent(messages: &[Message]) -> Vec<u64> {
             messages.iter().map(|m| seq_of(m, 1)).collect()
         }
         /// What a replay from the start answers: each sequence and payload.
         fn replayed(publisher: &Publisher) -> Vec<(u64, Vec<u8>)> {
-            let mut request = ZmqMessage::from(b"peer".to_vec());
-            request.push_back(Vec::new().into());
-            request.push_back(0u64.to_be_bytes().to_vec().into());
+            let request =
+                Message::multipart([b"peer".to_vec(), Vec::new(), 0u64.to_be_bytes().to_vec()]);
             let replies = publisher.replay(&request);
             replies[..replies.len() - 1]
                 .iter()
@@ -1140,34 +1113,30 @@ mod tests {
         let mut publisher = Publisher::new(b"kv".to_vec(), 10, 0, Wire::Sglang);
         publisher.publish(&startup_cleared(), &[]);
         publisher.publish(&sample_batch(), &[]);
-        let mut request = ZmqMessage::from(b"peer".to_vec());
-        request.push_back(Vec::new().into());
-        request.push_back(0u64.to_be_bytes().to_vec().into());
+        let request =
+            Message::multipart([b"peer".to_vec(), Vec::new(), 0u64.to_be_bytes().to_vec()]);
         let replies = publisher.replay(&request);
         assert_eq!(replies.len(), 3, "two batches and the end marker");
         assert_eq!(replies[0].len(), 4, "[peer, empty, seq, payload]");
-        assert_eq!(
-            replies[0].get(2).map(|f| f.as_ref()),
-            Some(&0u64.to_be_bytes()[..])
-        );
+        assert_eq!(replies[0].get(2), Some(&0u64.to_be_bytes()[..]));
         let first: WireBatch =
             rmp_serde::from_slice(replies[0].get(3).expect("payload")).expect("decodes");
         assert_eq!(first.events.len(), 1, "the startup clear comes first");
         let end = replies.last().expect("end");
         assert_eq!(end.len(), 4, "[peer, empty, END, empty]");
-        assert_eq!(end.get(2).map(|f| f.as_ref()), Some(&END_SEQ[..]));
+        assert_eq!(end.get(2), Some(&END_SEQ[..]));
         assert!(end.get(3).is_some_and(|f| f.is_empty()));
     }
 
     #[tokio::test]
     async fn sglang_publisher_starts_with_all_blocks_cleared() {
         let engine = Engine::spawn(EngineParams::default());
-        let mut pub_socket = PubSocket::new();
+        let pub_socket = Socket::new(SocketType::Pub, Options::default());
         pub_socket
             .bind("tcp://127.0.0.1:0")
             .await
             .expect("pub binds");
-        let mut router = RouterSocket::new();
+        let router = Socket::new(SocketType::Router, Options::default());
         let replay_endpoint = router
             .bind("tcp://127.0.0.1:0")
             .await
@@ -1187,13 +1156,12 @@ mod tests {
             reason = "the publisher ends with the engine when the test drops it"
         )]
         let _publisher = tokio::spawn(run(engine.clone(), cfg, pub_socket, Some(router)));
-        let mut dealer = DealerSocket::new();
+        let dealer = Socket::new(SocketType::Dealer, Options::default());
         dealer
             .connect(&replay_endpoint)
             .await
             .expect("dealer connects");
-        let mut request = ZmqMessage::from(Vec::new());
-        request.push_back(0u64.to_be_bytes().to_vec().into());
+        let request = Message::multipart([Vec::new(), 0u64.to_be_bytes().to_vec()]);
         // The publisher binds before the startup batch is buffered; ask until
         // the replay has it.
         let mut first = None;
@@ -1204,7 +1172,7 @@ mod tests {
                 .expect("replay answers")
                 .expect("reply");
             assert_eq!(reply.len(), 3, "[empty, seq, payload] on the SGLang wire");
-            if reply.get(1).map(|f| f.as_ref()) == Some(&END_SEQ[..]) {
+            if reply.get(1) == Some(&END_SEQ[..]) {
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 continue;
             }
@@ -1212,10 +1180,7 @@ mod tests {
             break;
         }
         let first = first.expect("the startup batch is replayable");
-        assert_eq!(
-            first.get(1).map(|f| f.as_ref()),
-            Some(&0u64.to_be_bytes()[..])
-        );
+        assert_eq!(first.get(1), Some(&0u64.to_be_bytes()[..]));
         let batch: WireBatch =
             rmp_serde::from_slice(first.get(2).expect("payload")).expect("decodes");
         assert_eq!(batch.events.len(), 1);
@@ -1232,13 +1197,13 @@ mod tests {
     #[tokio::test]
     async fn a_subscriber_gets_live_frames_and_can_replay_what_it_missed() {
         let engine = Engine::spawn(EngineParams::default());
-        let mut pub_socket = PubSocket::new();
+        let pub_socket = Socket::new(SocketType::Pub, Options::default());
         let endpoint = pub_socket
             .bind("tcp://127.0.0.1:0")
             .await
             .expect("pub binds")
             .to_string();
-        let mut router = RouterSocket::new();
+        let router = Socket::new(SocketType::Router, Options::default());
         let replay_endpoint = router
             .bind("tcp://127.0.0.1:0")
             .await
@@ -1259,7 +1224,7 @@ mod tests {
         )]
         let _publisher = tokio::spawn(run(engine.clone(), cfg, pub_socket, Some(router)));
 
-        let mut sub = SubSocket::new();
+        let sub = Socket::new(SocketType::Sub, Options::default());
         sub.subscribe("kv").await.expect("subscribe");
         sub.connect(&endpoint).await.expect("connect");
 
@@ -1284,27 +1249,19 @@ mod tests {
         }
         let first = first.expect("a live frame arrived");
         assert_eq!(first.len(), 3);
-        assert_eq!(first.get(0).map(|t| t.as_ref()), Some(&b"kv"[..]));
-        let live_seq = u64::from_be_bytes(
-            first
-                .get(1)
-                .expect("seq")
-                .as_ref()
-                .try_into()
-                .expect("8 bytes"),
-        );
+        assert_eq!(first.get(0), Some(&b"kv"[..]));
+        let live_seq = u64::from_be_bytes(first.get(1).expect("seq").try_into().expect("8 bytes"));
         let wire: WireBatch =
             rmp_serde::from_slice(first.get(2).expect("payload")).expect("decodes");
         assert!(!wire.events.is_empty());
 
         // Everything the subscriber missed is in the replay buffer, from 0.
-        let mut dealer = DealerSocket::new();
+        let dealer = Socket::new(SocketType::Dealer, Options::default());
         dealer
             .connect(&replay_endpoint)
             .await
             .expect("dealer connects");
-        let mut request = ZmqMessage::from(Vec::new());
-        request.push_back(0u64.to_be_bytes().to_vec().into());
+        let request = Message::multipart([Vec::new(), 0u64.to_be_bytes().to_vec()]);
         dealer.send(request).await.expect("replay request");
         let mut replayed = Vec::new();
         loop {
@@ -1314,12 +1271,10 @@ mod tests {
                 .expect("reply");
             assert_eq!(reply.len(), 4, "[empty, topic, seq, payload]");
             let seq = reply.get(2).expect("seq");
-            if seq.as_ref() == END_SEQ {
+            if seq == END_SEQ {
                 break;
             }
-            replayed.push(u64::from_be_bytes(
-                seq.as_ref().try_into().expect("8 bytes"),
-            ));
+            replayed.push(u64::from_be_bytes(seq.try_into().expect("8 bytes")));
             let _: WireBatch =
                 rmp_serde::from_slice(reply.get(3).expect("payload")).expect("decodes");
         }
@@ -1343,14 +1298,8 @@ mod tests {
                 events: tx,
             });
             if let Ok(Ok(message)) = timeout(Duration::from_millis(50), sub.recv()).await {
-                let seq = u64::from_be_bytes(
-                    message
-                        .get(1)
-                        .expect("seq")
-                        .as_ref()
-                        .try_into()
-                        .expect("8 bytes"),
-                );
+                let seq =
+                    u64::from_be_bytes(message.get(1).expect("seq").try_into().expect("8 bytes"));
                 // Sequence 0 was consumed live (or missed) before the restart;
                 // seeing it again means the publisher started over.
                 if seq == 0 {
@@ -1366,7 +1315,7 @@ mod tests {
 
 #[cfg(test)]
 mod endpoint_tests {
-    use zeromq::{prelude::Socket, PubSocket};
+    use omq_tokio::{Options, Socket, SocketType};
 
     use super::tcp_endpoint;
 
@@ -1389,7 +1338,7 @@ mod endpoint_tests {
         if std::net::TcpListener::bind("[::1]:0").is_err() {
             return;
         }
-        let mut publisher = PubSocket::new();
+        let publisher = Socket::new(SocketType::Pub, Options::default());
         let bound = publisher.bind(&tcp_endpoint("::1", 0)).await.unwrap();
         assert_eq!(
             bound.to_string().split("]:").next(),

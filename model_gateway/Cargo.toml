@@ -79,7 +79,7 @@ thiserror.workspace = true
 tonic.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-zeromq.workspace = true
+omq-tokio.workspace = true
 
 # Workspace dependencies (with extra features)
 axum = { workspace = true, features = ["macros", "multipart", "ws", "tracing"] }

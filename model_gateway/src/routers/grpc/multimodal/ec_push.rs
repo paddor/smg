@@ -428,16 +428,16 @@ async fn release_push(addr: &str, ids: &[String]) -> anyhow::Result<()> {
 async fn control_request(
     addr: &str,
     payload: serde_json::Value,
-    connection: &mut Option<zeromq::ReqSocket>,
+    connection: &mut Option<omq_tokio::Socket>,
 ) -> anyhow::Result<serde_json::Value> {
-    use zeromq::{Socket, SocketRecv, SocketSend};
+    use omq_tokio::{Options, Socket, SocketType};
     if connection.is_none() {
-        let mut socket = zeromq::ReqSocket::new();
+        let socket = Socket::new(SocketType::Req, Options::default());
         socket.connect(addr).await?;
         *connection = Some(socket);
     }
     let socket = connection
-        .as_mut()
+        .as_ref()
         .ok_or_else(|| anyhow::anyhow!("EC connection missing"))?;
     socket.send(payload.to_string().into()).await?;
     let reply = socket.recv().await?;
@@ -709,11 +709,11 @@ mod tests {
     /// Cleanup speaks the real JSON/REQ protocol and releases all TP shards.
     #[tokio::test]
     async fn dropped_push_releases_every_shard() {
-        use zeromq::{Socket, SocketRecv, SocketSend};
+        use omq_tokio::{Options, Socket, SocketType};
         for reject_first in [false, true] {
-            let mut first = zeromq::RepSocket::new();
+            let first = Socket::new(SocketType::Rep, Options::default());
             let addr = first.bind("tcp://127.0.0.1:0").await.unwrap().to_string();
-            let mut second = zeromq::RepSocket::new();
+            let second = Socket::new(SocketType::Rep, Options::default());
             let other = second.bind("tcp://127.0.0.1:0").await.unwrap().to_string();
             let ports: Vec<u16> = [&addr, &other]
                 .iter()
@@ -732,7 +732,7 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                for (shard, socket) in [&mut first, &mut second].into_iter().enumerate() {
+                for (shard, socket) in [&first, &second].into_iter().enumerate() {
                     for id in ["one", "two"] {
                         let message = socket.recv().await.unwrap();
                         let message: serde_json::Value =

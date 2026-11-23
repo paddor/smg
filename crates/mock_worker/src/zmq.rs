@@ -55,9 +55,9 @@ use crate::{
     script::{self, Answer, MatchedStop},
 };
 
-// zeromq queues sends and exposes no flush/linger operation. Keep both sockets
-// alive briefly after the last queued output so its background writer and the
-// frontend can consume it before input EOF fails the frontend's requests.
+// A send only queues its message. Keep both sockets alive briefly after the
+// last queued output so the socket writes it and the frontend consumes it
+// before input EOF fails the frontend's requests.
 // This is best-effort transport linger, not a delivery acknowledgement; the
 // process-wide drain deadline still bounds shutdown if the frontend is stuck.
 const OUTPUT_LINGER: Duration = Duration::from_secs(1);
